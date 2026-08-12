@@ -27,6 +27,7 @@ dependencies:
     - orjson==3.10.15
     - lpips
     - open3d==0.16.0
-    - torchmetrics
+    - pytorch-msssim==1.0.0
+    - torchmetrics==0.11.4
     - cyclonedds
     - git+https://github.com/JonathonLuiten/diff-gaussian-rasterization-w-depth.git@cb65e4b86bc3bd8ed42174b72a62e8d3a3a71110

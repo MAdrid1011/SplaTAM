@@ -25,17 +25,21 @@ from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, Replica
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
                                         ScannetPPDataset, NeRFCaptureDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params
-from utils.eval_helpers import eval, loss_fn_alex, report_loss, report_progress
+from utils.eval_helpers import eval, report_loss, report_progress
 from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
-from utils.slam_external import build_rotation, calc_psnr, calc_ssim, densify, prune_gaussians
+from utils.slam_external import build_rotation, calc_ssim, densify, prune_gaussians
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-from pytorch_msssim import ms_ssim
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+
+_native_lpips_model = None
+_NATIVE_QUALITY_PROTOCOL = "full_frame_rgb_v1"
 
 
 def _capture_session():
@@ -1066,17 +1070,17 @@ def _native_tracking_quality(params, variables, config, iter_time_idx, tracking_
             visualize_tracking_loss=False,
             capture_tracking_observation=True,
         )
-        color_mask = observation["color_mask"]
-        if not bool(color_mask.any().detach().item()):
-            raise RuntimeError("native Tracking quality requires at least one valid color-loss pixel")
-        rendered = observation["im"] * color_mask
-        ground_truth = tracking_curr_data["im"] * color_mask
-        rendered_image = torch.clamp(rendered.unsqueeze(0), 0.0, 1.0)
-        ground_truth_image = torch.clamp(ground_truth.unsqueeze(0), 0.0, 1.0)
+        global _native_lpips_model
+        if _native_lpips_model is None:
+            _native_lpips_model = LearnedPerceptualImagePatchSimilarity(
+                net_type="alex", normalize=True
+            ).to(observation["im"].device).eval()
+        try:
+            from simulator.quality import measure_full_frame_rgb_quality
+        except ModuleNotFoundError as error:
+            raise RuntimeError("native quality capture requires the repository simulator on PYTHONPATH") from error
         result = {
-            "psnr": float(calc_psnr(rendered, ground_truth).mean().detach().item()),
-            "ssim": float(ms_ssim(rendered_image, ground_truth_image, data_range=1.0, size_average=True).detach().item()),
-            "lpips": float(loss_fn_alex(rendered_image, ground_truth_image).detach().item()),
+            **measure_full_frame_rgb_quality(observation["im"], tracking_curr_data["im"], _native_lpips_model),
             "tracking_image_l1_sum": float(losses["im"].detach().item()),
             "tracking_depth_l1_sum": float(losses["depth"].detach().item()),
             "tracking_weighted_loss": float(loss.detach().item()),
@@ -1251,6 +1255,7 @@ def _record_native_streaming_accuracy(params, variables, config, time_idx, iter_
             "strict_commit": {
                 "ate": strict_ate,
                 "mapping_quality": strict_quality,
+                "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
                 "tracking_convergence": {
                     "completed_iterations": strict_result["completed_iterations"],
                     "best_loss": strict_result["best_loss"],
@@ -1261,6 +1266,7 @@ def _record_native_streaming_accuracy(params, variables, config, time_idx, iter_
             "streaming_commit": {
                 "ate": final_ate,
                 "mapping_quality": final_quality,
+                "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
                 "tracking_convergence": {
                     "completed_iterations": final_result["completed_iterations"],
                     "best_loss": final_result["best_loss"],
@@ -1405,7 +1411,8 @@ def _record_native_withdrawal_replay(params, variables, config, time_idx, iter_t
     """Withdraw one exact Mapping tile group and run the unmodified Tracking solver."""
     group = variables.get("_native_impact_group")
     capture = variables.get("_native_capture")
-    if group is None or capture is None or time_idx != 1:
+    capture_frame = variables.get("_native_streaming_capture_frame")
+    if group is None or capture is None or time_idx != capture_frame:
         return 0.0
 
     replay_start_time = time.time()
