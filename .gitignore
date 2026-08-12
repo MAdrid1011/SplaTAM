@@ -1,6 +1,6 @@
 # Sub-Directories
 configs/local
-data/
+data
 experiments/
 results/
 wandb/
