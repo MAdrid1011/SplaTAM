@@ -157,6 +157,7 @@ def remove_points(to_remove, params, variables, optimizer):
     variables['max_2D_radius'] = variables['max_2D_radius'][to_keep]
     if 'timestep' in variables.keys():
         variables['timestep'] = variables['timestep'][to_keep]
+    _capture_retain_ids(params, variables, to_keep, "remove_points")
     return params, variables
 
 
@@ -199,6 +200,7 @@ def densify(params, variables, optimizer, iter, densify_dict):
                         torch.max(torch.exp(params['log_scales']), dim=1).values <= 0.01 * variables['scene_radius']))
             new_params = {k: v[to_clone] for k, v in params.items() if k not in ['cam_unnorm_rots', 'cam_trans']}
             params = cat_params_to_optimizer(new_params, params, optimizer)
+            _capture_append_ids(params, variables, int(new_params['means3D'].shape[0]), "densify_clone")
             num_pts = params['means3D'].shape[0]
 
             padded_grad = torch.zeros(num_pts, device="cuda")
@@ -215,6 +217,7 @@ def densify(params, variables, optimizer, iter, densify_dict):
             new_params['means3D'] += torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
             new_params['log_scales'] = torch.log(torch.exp(new_params['log_scales']) / (0.8 * n))
             params = cat_params_to_optimizer(new_params, params, optimizer)
+            _capture_append_ids(params, variables, int(new_params['means3D'].shape[0]), "densify_split")
             num_pts = params['means3D'].shape[0]
 
             variables['means2D_gradient_accum'] = torch.zeros(num_pts, device="cuda")
@@ -241,6 +244,44 @@ def densify(params, variables, optimizer, iter, densify_dict):
             params = update_params_and_optimizer(new_params, params, optimizer)
 
     return params, variables
+
+
+def _capture_append_ids(params, variables, count, operation):
+    capture = variables.get("_native_capture")
+    if capture is None or variables.get("_native_minimal_capture_scope"):
+        return
+    stable_ids = variables["_native_gaussian_ids"]
+    before_count = len(stable_ids.ids)
+    added = stable_ids.append(count)
+    capture.record_native_event(
+        "structure",
+        f"slam_external.{operation}",
+        {
+            "operation": operation,
+            "before_count": before_count,
+            "after_count": int(params["means3D"].shape[0]),
+            "added_stable_ids": added,
+        },
+    )
+
+
+def _capture_retain_ids(params, variables, keep_mask, operation):
+    capture = variables.get("_native_capture")
+    if capture is None or variables.get("_native_minimal_capture_scope"):
+        return
+    stable_ids = variables["_native_gaussian_ids"]
+    before_count = len(stable_ids.ids)
+    removed = stable_ids.retain(keep_mask)
+    capture.record_native_event(
+        "structure",
+        f"slam_external.{operation}",
+        {
+            "operation": operation,
+            "before_count": before_count,
+            "after_count": int(params["means3D"].shape[0]),
+            "removed_stable_ids": removed,
+        },
+    )
 
 
 def update_learning_rate(optimizer, means3D_scheduler, iteration):

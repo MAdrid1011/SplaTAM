@@ -24,6 +24,7 @@ dependencies:
   - gxx_linux-64=10
   - pip
   - pip:
+    - orjson==3.10.15
     - lpips
     - open3d==0.16.0
     - torchmetrics

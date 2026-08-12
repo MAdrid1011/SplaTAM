@@ -25,16 +25,214 @@ from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, Replica
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
                                         ScannetPPDataset, NeRFCaptureDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params
-from utils.eval_helpers import report_loss, report_progress, eval
+from utils.eval_helpers import eval, loss_fn_alex, report_loss, report_progress
 from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
-from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.slam_external import build_rotation, calc_psnr, calc_ssim, densify, prune_gaussians
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from pytorch_msssim import ms_ssim
+
+
+def _capture_session():
+    if os.environ.get("THREEDGS_SLAM_NATIVE_CAPTURE") in (None, "", "0"):
+        return None
+    try:
+        from simulator.instrumentation import capture_session
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "native capture is enabled but simulator is unavailable; add the 3DGS-SLAM repository to PYTHONPATH"
+        ) from error
+    return capture_session("SplaTAM")
+
+
+def _capture_context(params, variables, frame, iteration, stage, source, source_frame=None):
+    capture = variables.get("_native_capture")
+    if capture is None:
+        return None
+    stable_ids = variables["_native_gaussian_ids"].require_size(int(params["means3D"].shape[0]))
+    return capture.make_rasterizer_context(
+        stable_ids,
+        frame=frame,
+        iteration=iteration,
+        stage=stage,
+        source=source,
+        source_frame=source_frame,
+    )
+
+
+def _rasterize_with_capture(rasterizer, render_args, params, variables, frame, iteration, stage, source, source_frame=None,
+                            evidence=None):
+    capture = variables.get("_native_capture")
+    if capture is None:
+        return rasterizer(**render_args)
+    from diff_gaussian_rasterization import set_binning_capture_callback
+
+    context = _capture_context(params, variables, frame, iteration, stage, source, source_frame)
+    evidence_destination = evidence
+    with capture.capture_rasterizer(set_binning_capture_callback, context) as captured_evidence:
+        rendered = rasterizer(**render_args)
+        _record_native_impact_tile(variables, context, stage, captured_evidence, rasterizer)
+    if evidence_destination is not None:
+        evidence_destination["rasterizer_sequence"] = captured_evidence.sequence
+    return rendered
+
+
+def _record_native_impact_tile(variables, context, stage, evidence, rasterizer):
+    """Keep the final frame-zero Mapping tile used by an optional withdrawal replay."""
+    if not variables.get("_native_impact_replay_enabled"):
+        return
+    if context.frame != 0 or stage != "mapping_render_rgb":
+        return
+    if context.iteration != variables.get("_native_impact_capture_iteration"):
+        return
+    if evidence.sequence is None or evidence.payload is None:
+        raise RuntimeError("native Mapping rasterizer did not emit a tile-list observation")
+
+    tile_ranges = evidence.payload["tile_ranges"].detach().cpu().tolist()
+    point_list = evidence.payload["point_list"].detach().cpu().tolist()
+    for tile_index, (start, end) in enumerate(tile_ranges):
+        if end <= start:
+            continue
+        point_indices = point_list[start:end]
+        stable_ids = tuple(context.stable_gaussian_ids[index] for index in point_indices)
+        if not stable_ids or len(set(stable_ids)) != len(stable_ids):
+            raise RuntimeError("native Mapping tile does not contain a unique stable Gaussian update group")
+        variables["_native_impact_group"] = {
+            "frame": context.frame,
+            "iteration": context.iteration,
+            "source_frame": context.source_frame,
+            "source": context.source,
+            "rasterizer_sequence": evidence.sequence,
+            "tile_index": tile_index,
+            "tile_range": [start, end],
+            "stable_gaussian_ids": stable_ids,
+        }
+        return
+
+
+def _record_loss_mask(variables, frame, iteration, stage, mask, source_frame=None):
+    capture = variables.get("_native_capture")
+    if capture is not None:
+        return capture.record_native_event(
+            "loss_mask",
+            "SplaTAM.get_loss",
+            {
+                "frame": frame,
+                "iteration": iteration,
+                "stage": stage,
+                "valid_pixel_mask": mask,
+                **({"source_frame": source_frame} if source_frame is not None else {}),
+            },
+        )
+    return None
+
+
+def _capture_replace_ids(params, variables, operation, source):
+    capture = variables.get("_native_capture")
+    if capture is None:
+        return
+    stable_ids = variables["_native_gaussian_ids"]
+    before_count = len(stable_ids.ids)
+    active = stable_ids.replace(int(params["means3D"].shape[0]))
+    capture.record_native_event(
+        "structure",
+        source,
+        {
+            "operation": operation,
+            "before_count": before_count,
+            "after_count": int(params["means3D"].shape[0]),
+            "stable_gaussian_ids": active,
+        },
+    )
+
+
+def _record_optimizer_step(variables, params, optimizer, frame, iteration, stage, phase, parameter_names=None):
+    capture = variables.get("_native_capture")
+    if capture is not None:
+        observed_parameters = params
+        if parameter_names is not None:
+            observed_parameters = {name: params[name] for name in parameter_names}
+        capture.record_native_event(
+            "optimizer",
+            "SplaTAM.rgbd_slam",
+            capture.optimizer_step_payload(
+                observed_parameters,
+                optimizer,
+                frame=frame,
+                iteration=iteration,
+                stage=stage,
+                phase=phase,
+            ),
+        )
+
+
+def _record_pose(variables, frame, iteration, phase, rotation, translation, losses, extended_tracking,
+                 source_frame, last_optimizer_iteration=None, termination=None, best_loss=None,
+                 coverage_stage="tracking_pose_coverage", optimizer_stage="tracking"):
+    capture = variables.get("_native_capture")
+    if capture is not None:
+        if phase == "ground_truth_assigned":
+            payload = {
+                "frame": frame,
+                "iteration": iteration,
+                "origin": "ground_truth_assignment",
+                "parameterization": "quaternion_translation_7d",
+                "ground_truth_rotation": rotation,
+                "ground_truth_translation": translation,
+            }
+        else:
+            normalized_rotation = F.normalize(rotation)
+            payload = {
+                "frame": frame,
+                "iteration": iteration,
+                "origin": "native_optimizer",
+                "phase": phase,
+                "parameterization": "quaternion_translation_7d",
+                "parameters": {
+                    "unnormalized_quaternion": rotation,
+                    "translation": translation,
+                },
+                "normalization": {
+                    "operation": "torch.nn.functional.normalize",
+                    "quaternion": normalized_rotation,
+                },
+                "committed_pose": {
+                    "quaternion": normalized_rotation,
+                    "translation": translation,
+                },
+                "optimizer_observation": {
+                    "source": "SplaTAM.rgbd_slam",
+                    "frame": frame,
+                    "iteration": last_optimizer_iteration,
+                    "stage": optimizer_stage,
+                },
+                "coverage": {
+                    "loss_mask": {
+                        "frame": frame,
+                        "iteration": last_optimizer_iteration,
+                        "stage": coverage_stage,
+                        "source_frame": source_frame,
+                    },
+                },
+                "convergence": {
+                    "losses": losses,
+                    "best_loss": best_loss,
+                    "extended_tracking": extended_tracking,
+                    "completed_iterations": iteration,
+                    "termination": termination,
+                },
+            }
+        return capture.record_native_event(
+            "pose",
+            "SplaTAM.rgbd_slam",
+            payload,
+        )
+    return None
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -153,6 +351,22 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
                  'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'denom': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'timestep': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+    capture = _capture_session()
+    if capture is not None:
+        stable_ids = capture.gaussian_ids("SplaTAM")
+        active = stable_ids.initialize(int(num_pts))
+        variables["_native_capture"] = capture
+        variables["_native_gaussian_ids"] = stable_ids
+        capture.record_native_event(
+            "structure",
+            "SplaTAM.initialize_params",
+            {
+                "operation": "initialize_params",
+                "before_count": 0,
+                "after_count": int(num_pts),
+                "stable_gaussian_ids": active,
+            },
+        )
 
     return params, variables
 
@@ -213,7 +427,9 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None,
+             capture_iteration=0, capture_frame=None, capture_tracking_observation=False,
+             capture_stage_override=None):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -246,11 +462,38 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
     # RGB Rendering
     rendervar['means2D'].retain_grad()
-    im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    capture_stage = capture_stage_override or (
+        "tracking_render" if tracking else "mapping_render" if mapping else "initialization_render"
+    )
+    capture_iteration = tracking_iteration if tracking_iteration is not None else capture_iteration
+    capture_frame = iter_time_idx if capture_frame is None else capture_frame
+    rgb_evidence = {} if capture_tracking_observation else None
+    im, radius, _, = _rasterize_with_capture(
+        Renderer(raster_settings=curr_data['cam']),
+        rendervar,
+        params,
+        variables,
+        capture_frame,
+        capture_iteration,
+        f"{capture_stage}_rgb",
+        "SplaTAM.get_loss.rgb",
+        source_frame=iter_time_idx,
+        evidence=rgb_evidence,
+    )
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
     # Depth & Silhouette Rendering
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth_sil, _, _, = _rasterize_with_capture(
+        Renderer(raster_settings=curr_data['cam']),
+        depth_sil_rendervar,
+        params,
+        variables,
+        capture_frame,
+        capture_iteration,
+        f"{capture_stage}_depth_silhouette",
+        "SplaTAM.get_loss.depth_silhouette",
+        source_frame=iter_time_idx,
+    )
     depth = depth_sil[0, :, :].unsqueeze(0)
     silhouette = depth_sil[1, :, :]
     presence_sil_mask = (silhouette > sil_thres)
@@ -270,6 +513,38 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # Mask with presence silhouette mask (accounts for empty space)
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
+    if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
+        color_mask = torch.tile(mask, (3, 1, 1))
+    else:
+        color_mask = torch.ones_like(curr_data['im'], dtype=torch.bool)
+    rgb_loss_mask_sequence = _record_loss_mask(
+        variables,
+        capture_frame,
+        capture_iteration,
+        f"{capture_stage}_rgb",
+        {"color": color_mask},
+        source_frame=iter_time_idx,
+    )
+    depth_loss_mask_sequence = _record_loss_mask(
+        variables,
+        capture_frame,
+        capture_iteration,
+        f"{capture_stage}_depth_silhouette",
+        {"depth": mask},
+        source_frame=iter_time_idx,
+    )
+    if tracking:
+        # Preserve the exact native depth-validity and silhouette mask that
+        # constrains the tracking solve; it is not reconstructed downstream.
+        pose_coverage_stage = "tracking_pose_coverage" if capture_stage == "tracking_render" else f"{capture_stage}_pose_coverage"
+        _record_loss_mask(
+            variables,
+            capture_frame,
+            capture_iteration,
+            pose_coverage_stage,
+            {"coverage": mask},
+            source_frame=iter_time_idx,
+        )
 
     # Depth loss
     if use_l1:
@@ -281,7 +556,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     
     # RGB Loss
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
-        color_mask = torch.tile(mask, (3, 1, 1))
         color_mask = color_mask.detach()
         losses['im'] = torch.abs(curr_data['im'] - im)[color_mask].sum()
     elif tracking:
@@ -344,6 +618,30 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     variables['seen'] = seen
     weighted_losses['loss'] = loss
 
+    if capture_tracking_observation:
+        if not tracking:
+            raise RuntimeError("capture_tracking_observation requires SplaTAM Tracking loss")
+        capture = variables.get("_native_capture")
+        if capture is not None and (
+            rgb_evidence is None
+            or rgb_evidence.get("rasterizer_sequence") is None
+            or rgb_loss_mask_sequence is None
+            or depth_loss_mask_sequence is None
+        ):
+            raise RuntimeError("streaming block capture requires direct RGB rasterizer and RGB/depth loss-mask observations")
+        return loss, variables, weighted_losses, {
+            "im": im,
+            "depth": depth,
+            "depth_mask": mask,
+            "color_mask": color_mask,
+            "capture_frame": capture_frame,
+            "capture_iteration": capture_iteration,
+            "capture_stage": capture_stage,
+            "rgb_rasterizer_sequence": rgb_evidence.get("rasterizer_sequence") if rgb_evidence is not None else None,
+            "rgb_loss_mask_sequence": rgb_loss_mask_sequence,
+            "depth_loss_mask_sequence": depth_loss_mask_sequence,
+        }
+
     return loss, variables, weighted_losses
 
 
@@ -381,7 +679,16 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth_sil, _, _, = _rasterize_with_capture(
+        Renderer(raster_settings=curr_data['cam']),
+        depth_sil_rendervar,
+        params,
+        variables,
+        time_idx,
+        0,
+        "mapping_growth_silhouette",
+        "SplaTAM.add_new_gaussians",
+    )
     silhouette = depth_sil[1, :, :]
     non_presence_sil_mask = (silhouette < sil_thres)
     # Check for new foreground objects by using GT depth
@@ -416,6 +723,21 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
+        capture = variables.get("_native_capture")
+        if capture is not None:
+            stable_ids = variables["_native_gaussian_ids"]
+            before_count = len(stable_ids.ids)
+            added = stable_ids.append(int(new_pt_cld.shape[0]))
+            capture.record_native_event(
+                "structure",
+                "SplaTAM.add_new_gaussians",
+                {
+                    "operation": "add_new_gaussians",
+                    "before_count": before_count,
+                    "after_count": int(params["means3D"].shape[0]),
+                    "added_stable_ids": added,
+                },
+            )
 
     return params, variables
 
@@ -450,6 +772,697 @@ def convert_params_to_store(params):
         else:
             params_to_store[k] = v
     return params_to_store
+
+
+_GAUSSIAN_PARAMETER_NAMES = (
+    "means3D",
+    "rgb_colors",
+    "unnorm_rotations",
+    "logit_opacities",
+    "log_scales",
+)
+
+
+def _snapshot_tensor_values(values):
+    return {name: value.detach().clone() for name, value in values.items() if isinstance(value, torch.Tensor)}
+
+
+def _restore_tensor_values(values, snapshot):
+    with torch.no_grad():
+        for name, value in snapshot.items():
+            if name not in values or not isinstance(values[name], torch.Tensor):
+                raise RuntimeError(f"cannot restore native replay value {name!r}")
+            if values[name].shape != value.shape:
+                raise RuntimeError(f"native replay shape changed for {name!r}")
+            values[name].copy_(value)
+
+
+def _snapshot_impact_baseline(params, variables):
+    stable_ids = tuple(variables["_native_gaussian_ids"].ids)
+    variables["_native_impact_baseline"] = {
+        "stable_gaussian_ids": stable_ids,
+        "parameters": {name: params[name].detach().clone() for name in _GAUSSIAN_PARAMETER_NAMES},
+    }
+
+
+def _withdraw_native_mapping_group(params, variables, group):
+    baseline = variables.get("_native_impact_baseline")
+    if baseline is None:
+        raise RuntimeError("native impact replay has no frame-zero Mapping baseline")
+    baseline_indices = {identifier: index for index, identifier in enumerate(baseline["stable_gaussian_ids"])}
+    current_indices = {identifier: index for index, identifier in enumerate(variables["_native_gaussian_ids"].ids)}
+    stable_ids = tuple(group["stable_gaussian_ids"])
+    if not stable_ids or any(identifier not in baseline_indices or identifier not in current_indices for identifier in stable_ids):
+        raise RuntimeError("native impact tile is no longer present after Mapping")
+
+    current = [current_indices[identifier] for identifier in stable_ids]
+    original = [baseline_indices[identifier] for identifier in stable_ids]
+    with torch.no_grad():
+        for name in _GAUSSIAN_PARAMETER_NAMES:
+            current_index = torch.tensor(current, device=params[name].device)
+            original_index = torch.tensor(original, device=params[name].device)
+            params[name].index_copy_(0, current_index, baseline["parameters"][name].index_select(0, original_index))
+
+
+def _tracking_result_summary(result):
+    return {
+        "completed_iterations": result["completed_iterations"],
+        "termination": result["termination"],
+        "extended_tracking": result["extended_tracking"],
+        "best_loss": result["best_loss"],
+        "losses": result["losses"],
+        "native_optimizer_parameters": {
+            "unnormalized_quaternion": result["rotation"].detach().cpu().tolist(),
+            "translation": result["translation"].detach().cpu().tolist(),
+        },
+        "committed_pose": {
+            "quaternion": F.normalize(result["rotation"]).detach().cpu().tolist(),
+            "translation": result["translation"].detach().cpu().tolist(),
+        },
+    }
+
+
+def _tracking_result_is_finite(result):
+    return bool(
+        torch.isfinite(result["rotation"]).all()
+        and torch.isfinite(result["translation"]).all()
+        and all(np.isfinite(value) for value in result["losses"].values())
+        and np.isfinite(result["best_loss"])
+    )
+
+
+def _load_frozen_streaming_capture_contract():
+    """Read default or explicitly selected frozen capture geometry."""
+    try:
+        from simulator.config import ArchitectureConfig
+    except ModuleNotFoundError as error:
+        raise RuntimeError("streaming accuracy capture requires the repository simulator on PYTHONPATH") from error
+
+    path = os.environ.get("THREEDGS_SLAM_NATIVE_CAPTURE_ARCHITECTURE")
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(_BASE_DIR)), "simulator", "config", "default_architecture.json")
+    architecture = ArchitectureConfig.load(path)
+    return {
+        "block_edge_pixels": architecture.block_edge_pixels,
+        "active_block_slots": architecture.architecture["active_block_slots"],
+        "minimum_inflight_blocks": architecture.minimum_inflight_blocks,
+    }
+
+
+def _snapshot_tracking_state(params, variables, time_idx):
+    return {
+        "rotation": params["cam_unnorm_rots"][..., time_idx].detach().clone(),
+        "translation": params["cam_trans"][..., time_idx].detach().clone(),
+        "max_2D_radius": variables["max_2D_radius"].detach().clone(),
+        "seen": variables.get("seen").detach().clone() if isinstance(variables.get("seen"), torch.Tensor) else None,
+    }
+
+
+def _restore_tracking_state(params, variables, time_idx, snapshot):
+    with torch.no_grad():
+        params["cam_unnorm_rots"][..., time_idx].copy_(snapshot["rotation"])
+        params["cam_trans"][..., time_idx].copy_(snapshot["translation"])
+        variables["max_2D_radius"].copy_(snapshot["max_2D_radius"])
+        if snapshot["seen"] is None:
+            variables.pop("seen", None)
+        else:
+            variables["seen"] = snapshot["seen"].detach().clone()
+
+
+def _native_successor_tracking_data(dataset, target_frame, tracking_curr_data):
+    """Load the immediate next RGB-D input without changing the strict trajectory state."""
+    successor_frame = target_frame + 1
+    if successor_frame >= len(dataset):
+        raise RuntimeError("native streaming successor lies outside the configured Tracking dataset")
+    color, depth, _, ground_truth_pose = dataset[successor_frame]
+    color = color.permute(2, 0, 1) / 255
+    depth = depth.permute(2, 0, 1)
+    return {
+        "cam": tracking_curr_data["cam"],
+        "im": color,
+        "depth": depth,
+        "id": successor_frame,
+        "intrinsics": tracking_curr_data["intrinsics"],
+        "w2c": tracking_curr_data["w2c"],
+        "iter_gt_w2c_list": list(tracking_curr_data["iter_gt_w2c_list"]) + [torch.linalg.inv(ground_truth_pose)],
+    }
+
+
+def _native_tracking_block_loss(curr_data, observation, loss_weights, x, y, width, height):
+    rows = slice(y, y + height)
+    columns = slice(x, x + width)
+    depth_error = torch.abs(curr_data["depth"][:, rows, columns] - observation["depth"][:, rows, columns])
+    image_error = torch.abs(curr_data["im"][:, rows, columns] - observation["im"][:, rows, columns])
+    depth_loss = depth_error[observation["depth_mask"][:, rows, columns]].sum()
+    image_loss = image_error[observation["color_mask"][:, rows, columns]].sum()
+    return depth_loss * loss_weights["depth"] + image_loss * loss_weights["im"]
+
+
+def _capture_native_tracking_blocks(params, variables, config, time_idx, iter_time_idx, tracking_curr_data, capture_stage,
+                                    capture_iteration, contract):
+    """Capture ordered native block-loss gradients with bounded host synchronization."""
+    if not config["tracking"]["use_l1"]:
+        raise RuntimeError("streaming accuracy capture requires SplaTAM's native L1 Tracking loss")
+    loss, variables, _, observation = get_loss(
+        params,
+        tracking_curr_data,
+        variables,
+        iter_time_idx,
+        config["tracking"]["loss_weights"],
+        config["tracking"]["use_sil_for_loss"],
+        config["tracking"]["sil_thres"],
+        config["tracking"]["use_l1"],
+        config["tracking"]["ignore_outlier_depth_loss"],
+        tracking=True,
+        plot_dir=None,
+        visualize_tracking_loss=False,
+        tracking_iteration=capture_iteration,
+        capture_frame=time_idx,
+        capture_tracking_observation=True,
+        capture_stage_override=capture_stage,
+    )
+    del loss
+
+    edge = contract["block_edge_pixels"]
+    required = contract["minimum_inflight_blocks"]
+    slot_limit = contract["active_block_slots"]
+    height, width = observation["depth_mask"].shape[-2:]
+    if required > slot_limit:
+        raise RuntimeError("frozen streaming candidate count exceeds the active block-slot contract")
+    if not isinstance(observation["depth_loss_mask_sequence"], int):
+        raise RuntimeError("streaming block capture requires a direct depth loss-mask observation")
+
+    rotation_gradient = torch.zeros_like(params["cam_unnorm_rots"])
+    translation_gradient = torch.zeros_like(params["cam_trans"])
+    padded_mask = F.pad(observation["depth_mask"], (0, (-width) % edge, 0, (-height) % edge))
+    tile_valid_pixels = padded_mask.unfold(-2, edge, edge).unfold(-2, edge, edge).sum(dim=(-1, -2)).detach().to("cpu")
+    selected_tiles = []
+    for y in range(0, height, edge):
+        for x in range(0, width, edge):
+            block_height = min(edge, height - y)
+            block_width = min(edge, width - x)
+            valid_pixels = int(tile_valid_pixels[..., y // edge, x // edge].item())
+            if valid_pixels == 0:
+                continue
+            selected_tiles.append((x, y, block_width, block_height, valid_pixels))
+            if len(selected_tiles) == required:
+                break
+        if len(selected_tiles) == required:
+            break
+    if len(selected_tiles) != required:
+        raise RuntimeError(f"native Tracking did not produce {required} valid observable blocks")
+
+    captured_gradients = []
+    observability = []
+    gradient_norms = []
+    for x, y, block_width, block_height, valid_pixels in selected_tiles:
+        block_loss = _native_tracking_block_loss(
+            tracking_curr_data, observation, config["tracking"]["loss_weights"], x, y, block_width, block_height
+        )
+        rotation_grad, translation_grad = torch.autograd.grad(
+            block_loss,
+            (params["cam_unnorm_rots"], params["cam_trans"]),
+            retain_graph=True,
+            allow_unused=False,
+        )
+        gradient_norm = torch.sqrt(rotation_grad.square().sum() + translation_grad.square().sum())
+        captured_gradients.append((rotation_grad, translation_grad, x, y, block_width, block_height, valid_pixels))
+        gradient_norms.append(gradient_norm)
+        observability.append(
+            torch.isfinite(rotation_grad).all()
+            & torch.isfinite(translation_grad).all()
+            & torch.isfinite(gradient_norm)
+            & (gradient_norm > 0)
+        )
+    # The default stream preserves tile order; materialize the evidence batch once.
+    observable = torch.stack(observability).detach().to("cpu").tolist()
+    gradient_norm_values = torch.stack(gradient_norms).detach().to("cpu").tolist()
+    if not all(observable):
+        raise RuntimeError("native Tracking selected a non-observable frozen streaming block")
+    completed_blocks = []
+    for completion_order, (rotation_grad, translation_grad, x, y, block_width, block_height, valid_pixels) in enumerate(captured_gradients):
+        rotation_gradient.add_(rotation_grad.detach())
+        translation_gradient.add_(translation_grad.detach())
+        completed_blocks.append(
+            {
+                "block_slot": completion_order,
+                "coordinates": {"x": x, "y": y, "width": block_width, "height": block_height},
+                "valid_pixels": valid_pixels,
+                "gradient_norm": float(gradient_norm_values[completion_order]),
+                "pose_observability_valid": True,
+                "completion_order": completion_order,
+                "rasterizer_sequence": observation["rgb_rasterizer_sequence"],
+                "loss_mask_sequence": observation["rgb_loss_mask_sequence"],
+                "validity_mask_sequence": observation["depth_loss_mask_sequence"],
+            }
+        )
+    return completed_blocks, rotation_gradient, translation_gradient
+
+
+def _capture_native_successor_tracking_blocks(params, variables, config, target_frame, successor_tracking_data,
+                                              capture_stage, capture_iteration, contract):
+    """Audit a candidate or final pose against the immediate next native RGB-D frame."""
+    successor_frame = target_frame + 1
+    if successor_tracking_data.get("id") != successor_frame:
+        raise RuntimeError("native streaming successor audit received a non-successor Tracking input")
+    successor_snapshot = _snapshot_tracking_state(params, variables, successor_frame)
+    try:
+        initialize_camera_pose(params, successor_frame, forward_prop=config["tracking"]["forward_prop"])
+        return _capture_native_tracking_blocks(
+            params,
+            variables,
+            config,
+            successor_frame,
+            successor_frame,
+            successor_tracking_data,
+            capture_stage,
+            capture_iteration,
+            contract,
+        )
+    finally:
+        _restore_tracking_state(params, variables, successor_frame, successor_snapshot)
+
+
+def _native_tracking_quality(params, variables, config, iter_time_idx, tracking_curr_data):
+    """Measure the active map by SplaTAM's native Tracking renderer without changing solver state."""
+    capture = variables.get("_native_capture")
+    radius = variables["max_2D_radius"].detach().clone()
+    seen = variables.get("seen")
+    seen_snapshot = seen.detach().clone() if isinstance(seen, torch.Tensor) else None
+    variables["_native_capture"] = None
+    try:
+        loss, _, losses, observation = get_loss(
+            params,
+            tracking_curr_data,
+            variables,
+            iter_time_idx,
+            config["tracking"]["loss_weights"],
+            config["tracking"]["use_sil_for_loss"],
+            config["tracking"]["sil_thres"],
+            config["tracking"]["use_l1"],
+            config["tracking"]["ignore_outlier_depth_loss"],
+            tracking=True,
+            plot_dir=None,
+            visualize_tracking_loss=False,
+            capture_tracking_observation=True,
+        )
+        color_mask = observation["color_mask"]
+        if not bool(color_mask.any().detach().item()):
+            raise RuntimeError("native Tracking quality requires at least one valid color-loss pixel")
+        rendered = observation["im"] * color_mask
+        ground_truth = tracking_curr_data["im"] * color_mask
+        rendered_image = torch.clamp(rendered.unsqueeze(0), 0.0, 1.0)
+        ground_truth_image = torch.clamp(ground_truth.unsqueeze(0), 0.0, 1.0)
+        result = {
+            "psnr": float(calc_psnr(rendered, ground_truth).mean().detach().item()),
+            "ssim": float(ms_ssim(rendered_image, ground_truth_image, data_range=1.0, size_average=True).detach().item()),
+            "lpips": float(loss_fn_alex(rendered_image, ground_truth_image).detach().item()),
+            "tracking_image_l1_sum": float(losses["im"].detach().item()),
+            "tracking_depth_l1_sum": float(losses["depth"].detach().item()),
+            "tracking_weighted_loss": float(loss.detach().item()),
+        }
+        del loss
+        return result
+    finally:
+        with torch.no_grad():
+            variables["max_2D_radius"].copy_(radius)
+            if seen_snapshot is None:
+                variables.pop("seen", None)
+            else:
+                variables["seen"] = seen_snapshot
+        variables["_native_capture"] = capture
+
+
+def _native_tracking_ate(params, tracking_curr_data, time_idx):
+    from utils.eval_helpers import evaluate_ate
+
+    with torch.no_grad():
+        gt_trajectory = tracking_curr_data["iter_gt_w2c_list"][:time_idx + 1]
+        estimated_trajectory = [tracking_curr_data["w2c"]]
+        for frame in range(1, time_idx + 1):
+            rotation = F.normalize(params["cam_unnorm_rots"][..., frame].detach())
+            translation = params["cam_trans"][..., frame].detach()
+            pose = torch.eye(4, device=rotation.device, dtype=rotation.dtype)
+            pose[:3, :3] = build_rotation(rotation)
+            pose[:3, 3] = translation
+            estimated_trajectory.append(pose)
+        return float(evaluate_ate(gt_trajectory, estimated_trajectory))
+
+
+def _run_native_streaming_candidate(params, variables, config, time_idx, iter_time_idx, tracking_curr_data,
+                                    contract, commit_iteration):
+    capture = variables.get("_native_capture")
+    if capture is None:
+        raise RuntimeError("streaming candidate requires an active native capture")
+    blocks, rotation_gradient, translation_gradient = _capture_native_tracking_blocks(
+        params,
+        variables,
+        config,
+        time_idx,
+        iter_time_idx,
+        tracking_curr_data,
+        "streaming_candidate_render",
+        commit_iteration,
+        contract,
+    )
+    optimizer = initialize_optimizer(params, config["tracking"]["lrs"], tracking=True)
+    params["cam_unnorm_rots"].grad = rotation_gradient
+    params["cam_trans"].grad = translation_gradient
+    _record_optimizer_step(
+        variables,
+        params,
+        optimizer,
+        time_idx,
+        commit_iteration,
+        "streaming_candidate",
+        "before_step",
+        parameter_names=("cam_unnorm_rots", "cam_trans"),
+    )
+    optimizer.step()
+    _record_optimizer_step(
+        variables,
+        params,
+        optimizer,
+        time_idx,
+        commit_iteration,
+        "streaming_candidate",
+        "after_step",
+        parameter_names=("cam_unnorm_rots", "cam_trans"),
+    )
+    optimizer.zero_grad(set_to_none=True)
+    candidate_rotation = params["cam_unnorm_rots"][..., time_idx].detach().clone()
+    candidate_translation = params["cam_trans"][..., time_idx].detach().clone()
+    accepted = bool(torch.isfinite(candidate_rotation).all().item() and torch.isfinite(candidate_translation).all().item())
+    if not accepted:
+        raise RuntimeError("native streaming candidate failed SplaTAM's finite pose validity check")
+    schedule_sequence = capture.record_native_event(
+        "streaming_schedule",
+        "SplaTAM.native_streaming_candidate",
+        {
+            "frame": time_idx,
+            "iteration": commit_iteration,
+            "candidate_round": 0,
+            "candidate_pose": {
+                "parameterization": "quaternion_translation_7d",
+                "parameters": {
+                    "unnormalized_quaternion": candidate_rotation,
+                    "translation": candidate_translation,
+                },
+                "normalization": {
+                    "operation": "torch.nn.functional.normalize",
+                    "quaternion": F.normalize(candidate_rotation),
+                },
+                "accepted": True,
+            },
+            "blocks": blocks,
+        },
+    )
+    return {"schedule_sequence": schedule_sequence, "block_count": len(blocks)}
+
+
+def _record_native_streaming_accuracy(params, variables, config, time_idx, iter_time_idx, tracking_curr_data,
+                                      successor_tracking_data, eval_dir, strict_result, pre_tracking_state, contract):
+    """Compare strict Tracking with a direct candidate followed by a native final recomputation."""
+    capture = variables.get("_native_capture")
+    strict_pose_sequence = strict_result.get("pose_sequence")
+    if capture is None or strict_pose_sequence is None:
+        raise RuntimeError("streaming accuracy capture requires a strict native pose observation")
+    strict_capture_iteration = strict_result["completed_iterations"] - 1
+    if strict_capture_iteration < 0:
+        raise RuntimeError("streaming accuracy capture requires at least one native Tracking iteration")
+
+    strict_quality = _native_tracking_quality(params, variables, config, iter_time_idx, tracking_curr_data)
+    strict_ate = _native_tracking_ate(params, tracking_curr_data, time_idx)
+    _restore_tracking_state(params, variables, time_idx, pre_tracking_state)
+    candidate = _run_native_streaming_candidate(
+        params, variables, config, time_idx, iter_time_idx, tracking_curr_data, contract, strict_capture_iteration
+    )
+    candidate_successor_blocks, _, _ = _capture_native_successor_tracking_blocks(
+        params,
+        variables,
+        config,
+        time_idx,
+        successor_tracking_data,
+        "streaming_candidate_successor_render",
+        strict_capture_iteration,
+        contract,
+    )
+    _restore_tracking_state(params, variables, time_idx, pre_tracking_state)
+    final_result, _, _ = _run_native_tracking_solver(
+        params,
+        variables,
+        config,
+        time_idx,
+        iter_time_idx,
+        tracking_curr_data,
+        eval_dir,
+        emit_progress=False,
+        capture_iterations={strict_result["completed_iterations"] - 1},
+        capture_stage="streaming_final_render",
+        optimizer_stage="streaming_final",
+    )
+    if final_result["completed_iterations"] != strict_result["completed_iterations"]:
+        raise RuntimeError("strict and final native Tracking solves reached different iteration counts")
+    final_capture_iteration = final_result["completed_iterations"] - 1
+    if final_capture_iteration != strict_capture_iteration:
+        raise RuntimeError("strict and final native Tracking renders use different final iterations")
+    final_pose_sequence = final_result.get("pose_sequence")
+    if final_pose_sequence is None:
+        raise RuntimeError("streaming final recomputation did not emit a native pose observation")
+    final_quality = _native_tracking_quality(params, variables, config, iter_time_idx, tracking_curr_data)
+    final_ate = _native_tracking_ate(params, tracking_curr_data, time_idx)
+    replayed_successor_blocks, _, _ = _capture_native_successor_tracking_blocks(
+        params,
+        variables,
+        config,
+        time_idx,
+        successor_tracking_data,
+        "streaming_final_replay_render",
+        final_capture_iteration,
+        contract,
+    )
+    if not candidate_successor_blocks:
+        raise RuntimeError("native streaming candidate produced no downstream block work")
+    replay_ratio = len(replayed_successor_blocks) / len(candidate_successor_blocks)
+    capture.record_native_event(
+        "accuracy",
+        "SplaTAM.native_streaming_accuracy",
+        {
+            "strict_commit": {
+                "ate": strict_ate,
+                "mapping_quality": strict_quality,
+                "tracking_convergence": {
+                    "completed_iterations": strict_result["completed_iterations"],
+                    "best_loss": strict_result["best_loss"],
+                    "final_weighted_loss": strict_result["losses"]["loss"],
+                },
+                "native_pose_sequence": strict_pose_sequence,
+            },
+            "streaming_commit": {
+                "ate": final_ate,
+                "mapping_quality": final_quality,
+                "tracking_convergence": {
+                    "completed_iterations": final_result["completed_iterations"],
+                    "best_loss": final_result["best_loss"],
+                    "final_weighted_loss": final_result["losses"]["loss"],
+                    "candidate_successor_blocks": len(candidate_successor_blocks),
+                    "replayed_successor_blocks": len(replayed_successor_blocks),
+                },
+                "replay_ratio": replay_ratio,
+                "convergence_rounds": 1,
+                "schedule_sequence": candidate["schedule_sequence"],
+                "final_native_pose_sequence": final_pose_sequence,
+            },
+        },
+    )
+
+
+def _run_native_tracking_solver(params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
+                                wandb_run=None, wandb_tracking_step=0, wandb_time_step=0, emit_progress=True,
+                                capture_iterations=None, capture_stage="tracking_render", optimizer_stage="tracking"):
+    """Run SplaTAM's Tracking loop for normal execution and withdrawal replay."""
+    optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
+    candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+    candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+    current_min_loss = float(1e20)
+    iter = 0
+    do_continue_slam = False
+    num_iters_tracking = config['tracking']['num_iters']
+    termination = None
+    tracking_iteration_seconds = 0.0
+    pose_coverage_stage = "tracking_pose_coverage" if capture_stage == "tracking_render" else f"{capture_stage}_pose_coverage"
+    progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+    while True:
+        iter_start_time = time.time()
+        capture = variables.get("_native_capture")
+        capture_this_iteration = capture_iterations is None or iter in capture_iterations
+        if capture is not None and not capture_this_iteration:
+            variables["_native_capture"] = None
+        try:
+            loss, variables, losses = get_loss(
+                params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
+                config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
+                config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True,
+                plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+                tracking_iteration=iter, capture_frame=time_idx, capture_stage_override=capture_stage,
+            )
+            if config['use_wandb'] and wandb_run is not None:
+                wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
+            loss.backward()
+            _record_optimizer_step(
+                variables,
+                params,
+                optimizer,
+                time_idx,
+                iter,
+                optimizer_stage,
+                "before_step",
+                parameter_names=("cam_unnorm_rots", "cam_trans") if capture_iterations is not None else None,
+            )
+            optimizer.step()
+            _record_optimizer_step(
+                variables,
+                params,
+                optimizer,
+                time_idx,
+                iter,
+                optimizer_stage,
+                "after_step",
+                parameter_names=("cam_unnorm_rots", "cam_trans") if capture_iterations is not None else None,
+            )
+            optimizer.zero_grad(set_to_none=True)
+        finally:
+            variables["_native_capture"] = capture
+        with torch.no_grad():
+            if loss < current_min_loss:
+                current_min_loss = loss
+                candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+                candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+            if emit_progress and config['report_iter_progress']:
+                if config['use_wandb'] and wandb_run is not None:
+                    report_progress(
+                        params, tracking_curr_data, iter + 1, progress_bar, iter_time_idx,
+                        sil_thres=config['tracking']['sil_thres'], tracking=True, wandb_run=wandb_run,
+                        wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'],
+                    )
+                else:
+                    report_progress(params, tracking_curr_data, iter + 1, progress_bar, iter_time_idx,
+                                    sil_thres=config['tracking']['sil_thres'], tracking=True)
+            else:
+                progress_bar.update(1)
+        tracking_iteration_seconds += time.time() - iter_start_time
+        iter += 1
+        if iter == num_iters_tracking:
+            if losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
+                termination = {
+                    "reason": "depth_loss_threshold",
+                    "threshold_enabled": True,
+                    "threshold": config['tracking']['depth_loss_thres'],
+                }
+                break
+            if config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
+                do_continue_slam = True
+                progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+                num_iters_tracking = 2 * num_iters_tracking
+                if config['use_wandb'] and wandb_run is not None:
+                    wandb_run.log({"Tracking/Extra Tracking Iters Frames": time_idx, "Tracking/step": wandb_time_step})
+            else:
+                termination = {
+                    "reason": "iteration_limit",
+                    "threshold_enabled": config['tracking']['use_depth_loss_thres'],
+                    "configured_iterations": num_iters_tracking,
+                }
+                break
+
+    progress_bar.close()
+    if capture_iterations is not None and iter - 1 not in capture_iterations:
+        raise RuntimeError("final native Tracking iteration was excluded from the requested capture scope")
+    final_optimizer_iteration = iter - 1
+    with torch.no_grad():
+        params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
+        params['cam_trans'][..., time_idx] = candidate_cam_tran
+        pose_sequence = _record_pose(
+            variables, time_idx, final_optimizer_iteration, "candidate_committed", candidate_cam_unnorm_rot, candidate_cam_tran,
+            losses, do_continue_slam, source_frame=iter_time_idx, last_optimizer_iteration=final_optimizer_iteration,
+            termination=termination, best_loss=current_min_loss, coverage_stage=pose_coverage_stage,
+            optimizer_stage=optimizer_stage,
+        )
+    result = {
+        "rotation": candidate_cam_unnorm_rot,
+        "translation": candidate_cam_tran,
+        "losses": {name: float(value.detach().item()) for name, value in losses.items()},
+        "best_loss": float(current_min_loss.detach().item()),
+        "extended_tracking": do_continue_slam,
+        "completed_iterations": iter,
+        "termination": termination,
+        "pose_sequence": pose_sequence,
+    }
+    return result, tracking_iteration_seconds, wandb_tracking_step
+
+
+def _record_native_withdrawal_replay(params, variables, config, time_idx, iter_time_idx, tracking_curr_data,
+                                      eval_dir, baseline_result):
+    """Withdraw one exact Mapping tile group and run the unmodified Tracking solver."""
+    group = variables.get("_native_impact_group")
+    capture = variables.get("_native_capture")
+    if group is None or capture is None or time_idx != 1:
+        return 0.0
+
+    replay_start_time = time.time()
+    params_after_tracking = _snapshot_tensor_values(params)
+    variables_after_tracking = _snapshot_tensor_values(variables)
+    variables["_native_capture"] = None
+    try:
+        _withdraw_native_mapping_group(params, variables, group)
+        initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
+        replay_result, _, _ = _run_native_tracking_solver(
+            params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
+            emit_progress=False,
+        )
+    finally:
+        _restore_tensor_values(params, params_after_tracking)
+        for name, value in variables_after_tracking.items():
+            variables[name] = value
+        variables["_native_capture"] = capture
+
+    verification_outcome = _tracking_result_is_finite(replay_result)
+    capture.record_native_event(
+        "impact",
+        "SplaTAM.native_withdrawal_replay",
+        {
+            "frame": time_idx,
+            "iteration": group["iteration"],
+            "stage": "tracking_withdrawal_replay",
+            "stable_gaussian_ids": group["stable_gaussian_ids"],
+            "consumer_group": 0,
+            "consumer_group_generation": 0,
+            "offline_label": "conservative",
+            "label_source": "native Mapping-tile withdrawal replay; no upstream low-impact acceptance rule",
+            "withdrawal_replay_id": f"splatam-frame-{time_idx}-map-{group['frame']}-iter-{group['iteration']}-tile-{group['tile_index']}",
+            "false_positive": False,
+            "false_negative": False,
+            "local_verification": {
+                "outcome": verification_outcome,
+                "method": "native_tracking_solver_finite_result",
+            },
+            "consumer_group_binding": {
+                "native_rasterizer_sequence": group["rasterizer_sequence"],
+                "native_tile_index": group["tile_index"],
+                "native_tile_range": group["tile_range"],
+                "fresh_replay_group": True,
+            },
+            "withdrawal": {
+                "source_frame": group["frame"],
+                "source_iteration": group["iteration"],
+                "source_view": group["source_frame"],
+                "parameter_names": list(_GAUSSIAN_PARAMETER_NAMES),
+                "operation": "restore_pre_mapping_values_for_native_tile_group",
+            },
+            "baseline_tracking": _tracking_result_summary(baseline_result),
+            "withdrawn_tracking": _tracking_result_summary(replay_result),
+        },
+    )
+    return time.time() - replay_start_time
 
 
 def rgbd_slam(config: dict):
@@ -612,6 +1625,7 @@ def rgbd_slam(config: dict):
         variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
         variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
         variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+        _capture_replace_ids(params, variables, "load_checkpoint", "SplaTAM.rgbd_slam")
         # Load the keyframe time idx list
         keyframe_time_indices = np.load(os.path.join(config['workdir'], config['run_name'], f"keyframe_time_indices{checkpoint_time_idx}.npy"))
         keyframe_time_indices = keyframe_time_indices.tolist()
@@ -638,6 +1652,34 @@ def rgbd_slam(config: dict):
                 keyframe_list.append(curr_keyframe)
     else:
         checkpoint_time_idx = 0
+
+    if config.get("native_impact_replay", False):
+        if variables.get("_native_capture") is None:
+            raise RuntimeError("native_impact_replay requires THREEDGS_SLAM_NATIVE_CAPTURE=1")
+        mapping_iterations = config["mapping"]["num_iters"]
+        if not isinstance(mapping_iterations, int) or mapping_iterations <= 0:
+            raise RuntimeError("native_impact_replay requires a positive integer mapping.num_iters")
+        variables["_native_impact_replay_enabled"] = True
+        variables["_native_impact_capture_iteration"] = mapping_iterations - 1
+
+    if config.get("native_streaming_accuracy", False):
+        if variables.get("_native_capture") is None:
+            raise RuntimeError("native_streaming_accuracy requires THREEDGS_SLAM_NATIVE_CAPTURE=1")
+        if config.get("native_capture_scope") != "streaming_accuracy":
+            raise RuntimeError("native_streaming_accuracy requires native_capture_scope='streaming_accuracy'")
+        if not config.get("native_impact_replay", False):
+            raise RuntimeError("native_streaming_accuracy requires the native Impact withdrawal replay")
+        if config["tracking"]["use_gt_poses"] or config["tracking"]["use_depth_loss_thres"]:
+            raise RuntimeError("native_streaming_accuracy requires unextended native optimizer Tracking")
+        capture_frame = config.get("native_streaming_capture_frame", num_frames - 2)
+        if not isinstance(capture_frame, int) or isinstance(capture_frame, bool) or capture_frame <= 0 or capture_frame != num_frames - 2:
+            raise RuntimeError(
+                "native_streaming_capture_frame must select the penultimate configured frame for a real successor audit"
+            )
+        variables["_native_streaming_accuracy_enabled"] = True
+        variables["_native_streaming_capture_frame"] = capture_frame
+        variables["_native_streaming_contract"] = _load_frozen_streaming_capture_contract()
+        variables["_native_minimal_capture_scope"] = True
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
@@ -675,73 +1717,44 @@ def rgbd_slam(config: dict):
 
         # Tracking
         tracking_start_time = time.time()
+        native_tracking_result = None
+        withdrawal_replay_seconds = 0.0
+        streaming_accuracy_seconds = 0.0
+        streaming_target = bool(
+            variables.get("_native_streaming_accuracy_enabled")
+            and time_idx == variables["_native_streaming_capture_frame"]
+        )
+        streaming_successor = bool(
+            variables.get("_native_streaming_accuracy_enabled")
+            and time_idx == variables["_native_streaming_capture_frame"] + 1
+        )
+        capture_streaming_tracking = streaming_target or streaming_successor
+        pre_tracking_state = _snapshot_tracking_state(params, variables, time_idx) if streaming_target else None
+        successor_tracking_data = None
+        if streaming_target:
+            successor_tracking_data = _native_successor_tracking_data(
+                tracking_dataset if seperate_tracking_res else dataset,
+                time_idx,
+                tracking_curr_data,
+            )
         if time_idx > 0 and not config['tracking']['use_gt_poses']:
-            # Reset Optimizer & Learning Rates for tracking
-            optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
-            # Keep Track of Best Candidate Rotation & Translation
-            candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
-            candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
-            current_min_loss = float(1e20)
-            # Tracking Optimization
-            iter = 0
-            do_continue_slam = False
-            num_iters_tracking = config['tracking']['num_iters']
-            progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
-            while True:
-                iter_start_time = time.time()
-                # Loss for current frame
-                loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
-                                                   config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
-                                                   config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
-                                                   plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter)
-                if config['use_wandb']:
-                    # Report Loss
-                    wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
-                # Backprop
-                loss.backward()
-                # Optimizer Update
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    # Save the best candidate rotation & translation
-                    if loss < current_min_loss:
-                        current_min_loss = loss
-                        candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
-                        candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
-                    # Report Progress
-                    if config['report_iter_progress']:
-                        if config['use_wandb']:
-                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
-                                            wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
-                        else:
-                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
-                    else:
-                        progress_bar.update(1)
-                # Update the runtime numbers
-                iter_end_time = time.time()
-                tracking_iter_time_sum += iter_end_time - iter_start_time
-                tracking_iter_time_count += 1
-                # Check if we should stop tracking
-                iter += 1
-                if iter == num_iters_tracking:
-                    if losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
-                        break
-                    elif config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
-                        do_continue_slam = True
-                        progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
-                        num_iters_tracking = 2*num_iters_tracking
-                        if config['use_wandb']:
-                            wandb_run.log({"Tracking/Extra Tracking Iters Frames": time_idx,
-                                        "Tracking/step": wandb_time_step})
-                    else:
-                        break
-
-            progress_bar.close()
-            # Copy over the best candidate rotation & translation
-            with torch.no_grad():
-                params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
-                params['cam_trans'][..., time_idx] = candidate_cam_tran
+            capture = variables.get("_native_capture")
+            if variables.get("_native_minimal_capture_scope") and not capture_streaming_tracking:
+                variables["_native_capture"] = None
+            try:
+                if streaming_successor:
+                    _capture_replace_ids(params, variables, "resume_successor_tracking_capture", "SplaTAM.rgbd_slam")
+                native_tracking_result, tracking_seconds, wandb_tracking_step = _run_native_tracking_solver(
+                    params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
+                    wandb_run=wandb_run if config['use_wandb'] else None,
+                    wandb_tracking_step=wandb_tracking_step if config['use_wandb'] else 0,
+                    wandb_time_step=wandb_time_step if config['use_wandb'] else 0,
+                    capture_iterations={config["tracking"]["num_iters"] - 1} if capture_streaming_tracking else None,
+                )
+            finally:
+                variables["_native_capture"] = capture
+            tracking_iter_time_sum += tracking_seconds
+            tracking_iter_time_count += native_tracking_result["completed_iterations"]
         elif time_idx > 0 and config['tracking']['use_gt_poses']:
             with torch.no_grad():
                 # Get the ground truth pose relative to frame 0
@@ -752,9 +1765,43 @@ def rgbd_slam(config: dict):
                 # Update the camera parameters
                 params['cam_unnorm_rots'][..., time_idx] = rel_w2c_rot_quat
                 params['cam_trans'][..., time_idx] = rel_w2c_tran
+                _record_pose(
+                    variables,
+                    time_idx,
+                    0,
+                    "ground_truth_assigned",
+                    rel_w2c_rot_quat,
+                    rel_w2c_tran,
+                    {},
+                    False,
+                    source_frame=iter_time_idx,
+                )
+        if streaming_target and native_tracking_result is not None:
+            if successor_tracking_data is None:
+                raise RuntimeError("native streaming accuracy has no immediate successor Tracking input")
+            streaming_start_time = time.time()
+            _record_native_streaming_accuracy(
+                params,
+                variables,
+                config,
+                time_idx,
+                iter_time_idx,
+                tracking_curr_data,
+                successor_tracking_data,
+                eval_dir,
+                native_tracking_result,
+                pre_tracking_state,
+                variables["_native_streaming_contract"],
+            )
+            streaming_accuracy_seconds = time.time() - streaming_start_time
+        if variables.get("_native_impact_replay_enabled") and native_tracking_result is not None:
+            withdrawal_replay_seconds = _record_native_withdrawal_replay(
+                params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
+                native_tracking_result,
+            )
         # Update the runtime numbers
         tracking_end_time = time.time()
-        tracking_frame_time_sum += tracking_end_time - tracking_start_time
+        tracking_frame_time_sum += tracking_end_time - tracking_start_time - withdrawal_replay_seconds - streaming_accuracy_seconds
         tracking_frame_time_count += 1
 
         if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
@@ -789,9 +1836,15 @@ def rgbd_slam(config: dict):
                     densify_curr_data = curr_data
 
                 # Add new Gaussians to the scene based on the Silhouette
-                params, variables = add_new_gaussians(params, variables, densify_curr_data, 
-                                                      config['mapping']['sil_thres'], time_idx,
-                                                      config['mean_sq_dist_method'], config['gaussian_distribution'])
+                capture = variables.get("_native_capture")
+                if variables.get("_native_minimal_capture_scope"):
+                    variables["_native_capture"] = None
+                try:
+                    params, variables = add_new_gaussians(params, variables, densify_curr_data,
+                                                          config['mapping']['sil_thres'], time_idx,
+                                                          config['mean_sq_dist_method'], config['gaussian_distribution'])
+                finally:
+                    variables["_native_capture"] = capture
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
@@ -819,6 +1872,8 @@ def rgbd_slam(config: dict):
                 print(f"\nSelected Keyframes at Frame {time_idx}: {selected_time_idx}")
 
             # Reset Optimizer & Learning Rates for Full Map Optimization
+            if variables.get("_native_impact_replay_enabled") and time_idx == 0:
+                _snapshot_impact_baseline(params, variables)
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
 
             # Mapping
@@ -844,9 +1899,19 @@ def rgbd_slam(config: dict):
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 # Loss for current frame
-                loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
-                                                config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                capture = variables.get("_native_capture")
+                capture_mapping_tile = (
+                    time_idx == 0 and iter == variables.get("_native_impact_capture_iteration")
+                )
+                if variables.get("_native_minimal_capture_scope") and not capture_mapping_tile:
+                    variables["_native_capture"] = None
+                try:
+                    loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
+                                                    config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
+                                                    config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True,
+                                                    capture_iteration=iter, capture_frame=time_idx)
+                finally:
+                    variables["_native_capture"] = capture
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -866,7 +1931,11 @@ def rgbd_slam(config: dict):
                             wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
                     # Optimizer Update
+                    if not variables.get("_native_minimal_capture_scope"):
+                        _record_optimizer_step(variables, params, optimizer, time_idx, iter, "mapping", "before_step")
                     optimizer.step()
+                    if not variables.get("_native_minimal_capture_scope"):
+                        _record_optimizer_step(variables, params, optimizer, time_idx, iter, "mapping", "after_step")
                     optimizer.zero_grad(set_to_none=True)
                     # Report Progress
                     if config['report_iter_progress']:
@@ -988,6 +2057,9 @@ def rgbd_slam(config: dict):
     # Close WandB Run
     if config['use_wandb']:
         wandb.finish()
+    capture = variables.get("_native_capture")
+    if capture is not None:
+        capture.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
