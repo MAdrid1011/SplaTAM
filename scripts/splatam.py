@@ -39,7 +39,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
 _native_lpips_model = None
-_NATIVE_QUALITY_PROTOCOL = "full_frame_rgb_v1"
+_NATIVE_QUALITY_PROTOCOL = "valid_depth_rgb_v2"
 
 
 def _capture_session():
@@ -1076,11 +1076,16 @@ def _native_tracking_quality(params, variables, config, iter_time_idx, tracking_
                 net_type="alex", normalize=True
             ).to(observation["im"].device).eval()
         try:
-            from simulator.quality import measure_full_frame_rgb_quality
+            from simulator.quality import measure_valid_depth_rgb_quality
         except ModuleNotFoundError as error:
             raise RuntimeError("native quality capture requires the repository simulator on PYTHONPATH") from error
         result = {
-            **measure_full_frame_rgb_quality(observation["im"], tracking_curr_data["im"], _native_lpips_model),
+            **measure_valid_depth_rgb_quality(
+                observation["im"],
+                tracking_curr_data["im"],
+                tracking_curr_data["depth"],
+                _native_lpips_model,
+            ),
             "tracking_image_l1_sum": float(losses["im"].detach().item()),
             "tracking_depth_l1_sum": float(losses["depth"].detach().item()),
             "tracking_weighted_loss": float(loss.detach().item()),
