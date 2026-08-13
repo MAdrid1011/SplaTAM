@@ -87,7 +87,7 @@ def _rasterize_with_capture(rasterizer, render_args, params, variables, frame, i
 
 
 def _record_native_impact_tile(variables, context, stage, evidence, rasterizer):
-    """Keep the final frame-zero Mapping tile used by an optional withdrawal replay."""
+    """Keep the final frame-zero Mapping tile for the next-frame withdrawal replay."""
     if not variables.get("_native_impact_replay_enabled"):
         return
     if context.frame != 0 or stage != "mapping_render_rgb":
@@ -1416,8 +1416,7 @@ def _record_native_withdrawal_replay(params, variables, config, time_idx, iter_t
     """Withdraw one exact Mapping tile group and run the unmodified Tracking solver."""
     group = variables.get("_native_impact_group")
     capture = variables.get("_native_capture")
-    capture_frame = variables.get("_native_streaming_capture_frame")
-    if group is None or capture is None or time_idx != capture_frame:
+    if group is None or capture is None or time_idx != group["frame"] + 1:
         return 0.0
 
     replay_start_time = time.time()
