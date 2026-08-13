@@ -1754,8 +1754,9 @@ def rgbd_slam(config: dict):
             if variables.get("_native_minimal_capture_scope") and not capture_streaming_tracking:
                 variables["_native_capture"] = None
             try:
-                if streaming_successor:
-                    _capture_replace_ids(params, variables, "resume_successor_tracking_capture", "SplaTAM.rgbd_slam")
+                if streaming_target or streaming_successor:
+                    phase = "target" if streaming_target else "successor"
+                    _capture_replace_ids(params, variables, f"resume_{phase}_tracking_capture", "SplaTAM.rgbd_slam")
                 native_tracking_result, tracking_seconds, wandb_tracking_step = _run_native_tracking_solver(
                     params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
                     wandb_run=wandb_run if config['use_wandb'] else None,
