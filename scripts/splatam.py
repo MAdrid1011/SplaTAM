@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -801,6 +802,46 @@ def _restore_tensor_values(values, snapshot):
             values[name].copy_(value)
 
 
+def _native_clone_params(params):
+    """Clone native solver parameters for an isolated quality replay."""
+    result = {}
+    for name, value in params.items():
+        if isinstance(value, torch.Tensor):
+            result[name] = torch.nn.Parameter(value.detach().clone().requires_grad_(value.requires_grad))
+        else:
+            result[name] = value
+    return result
+
+
+def _native_clone_variables(variables):
+    """Clone mutable solver state while retaining the capture session handle."""
+    result = {}
+    for name, value in variables.items():
+        if name.startswith("_native_"):
+            result[name] = value
+        elif isinstance(value, torch.Tensor):
+            result[name] = value.detach().clone()
+        else:
+            result[name] = copy.deepcopy(value)
+    return result
+
+
+def _native_clone_data(data):
+    result = {}
+    for name, value in data.items():
+        if isinstance(value, torch.Tensor):
+            result[name] = value.detach().clone()
+        elif isinstance(value, list):
+            result[name] = [item.detach().clone() if isinstance(item, torch.Tensor) else copy.deepcopy(item) for item in value]
+        else:
+            result[name] = copy.deepcopy(value)
+    return result
+
+
+def _native_clone_keyframe_list(keyframe_list):
+    return [_native_clone_data(keyframe) for keyframe in keyframe_list]
+
+
 def _snapshot_impact_baseline(params, variables):
     stable_ids = tuple(variables["_native_gaussian_ids"].ids)
     variables["_native_impact_baseline"] = {
@@ -1189,9 +1230,9 @@ def _run_native_streaming_candidate(params, variables, config, time_idx, iter_ti
     return {"schedule_sequence": schedule_sequence, "block_count": len(blocks)}
 
 
-def _record_native_streaming_accuracy(params, variables, config, time_idx, iter_time_idx, tracking_curr_data,
-                                      successor_tracking_data, eval_dir, strict_result, pre_tracking_state, contract):
-    """Compare strict Tracking with a direct candidate followed by a native final recomputation."""
+def _prepare_native_streaming_accuracy(params, variables, config, time_idx, iter_time_idx, tracking_curr_data,
+                                       strict_result, pre_tracking_state, contract):
+    """Emit the target candidate schedule and retain its pre-Mapping state."""
     capture = variables.get("_native_capture")
     strict_pose_sequence = strict_result.get("pose_sequence")
     if capture is None or strict_pose_sequence is None:
@@ -1199,89 +1240,204 @@ def _record_native_streaming_accuracy(params, variables, config, time_idx, iter_
     strict_capture_iteration = strict_result["completed_iterations"] - 1
     if strict_capture_iteration < 0:
         raise RuntimeError("streaming accuracy capture requires at least one native Tracking iteration")
-
-    strict_quality = _native_tracking_quality(params, variables, config, iter_time_idx, tracking_curr_data)
-    strict_ate = _native_tracking_ate(params, tracking_curr_data, time_idx)
+    strict_tracking_state = _snapshot_tracking_state(params, variables, time_idx)
     _restore_tracking_state(params, variables, time_idx, pre_tracking_state)
     candidate = _run_native_streaming_candidate(
         params, variables, config, time_idx, iter_time_idx, tracking_curr_data, contract, strict_capture_iteration
     )
-    candidate_successor_blocks, _, _ = _capture_native_successor_tracking_blocks(
-        params,
-        variables,
-        config,
-        time_idx,
-        successor_tracking_data,
-        "streaming_candidate_successor_render",
-        strict_capture_iteration,
-        contract,
+    candidate_params = _native_clone_params(params)
+    candidate_variables = _native_clone_variables(variables)
+    _restore_tracking_state(params, variables, time_idx, strict_tracking_state)
+    return {
+        "frame": time_idx,
+        "iteration": strict_capture_iteration,
+        "strict_result": strict_result,
+        "strict_pose_sequence": strict_pose_sequence,
+        "strict_tracking_state": strict_tracking_state,
+        "pre_tracking_state": pre_tracking_state,
+        "target_data": _native_clone_data(tracking_curr_data),
+        "candidate": candidate,
+        "candidate_params": candidate_params,
+        "candidate_variables": candidate_variables,
+        "contract": contract,
+    }
+
+
+def _native_mapping_replay(params, variables, config, time_idx, curr_data, keyframe_list, gt_w2c_all_frames,
+                           first_frame_w2c, mapping_rng_state):
+    """Complete one official Mapping step on an isolated native trajectory."""
+    if mapping_rng_state is None:
+        raise RuntimeError("native Mapping replay requires the original keyframe selection RNG state")
+    capture = variables.pop("_native_capture", None)
+    try:
+        add_new_gaussians(
+            params, variables, curr_data, config["mapping"]["sil_thres"], time_idx,
+            config["mean_sq_dist_method"], config["gaussian_distribution"],
+        )
+        with torch.no_grad():
+            rotation = F.normalize(params["cam_unnorm_rots"][..., time_idx].detach())
+            translation = params["cam_trans"][..., time_idx].detach()
+            w2c = torch.eye(4, device=rotation.device, dtype=rotation.dtype)
+            w2c[:3, :3] = build_rotation(rotation)
+            w2c[:3, 3] = translation
+            selected = list(keyframe_selection_overlap(
+                curr_data["depth"], w2c, curr_data["intrinsics"], keyframe_list[:-1], config["mapping_window_size"] - 2
+            ))
+            if keyframe_list:
+                selected.append(len(keyframe_list) - 1)
+            selected.append(-1)
+        optimizer = initialize_optimizer(params, config["mapping"]["lrs"], tracking=False)
+        saved_rng_state = np.random.get_state()
+        np.random.set_state(copy.deepcopy(mapping_rng_state))
+        try:
+            for iteration in range(config["mapping"]["num_iters"]):
+                selected_index = selected[np.random.randint(0, len(selected))]
+                if selected_index == -1:
+                    iter_time_idx = time_idx
+                    iter_data = curr_data
+                else:
+                    keyframe = keyframe_list[selected_index]
+                    iter_time_idx = keyframe["id"]
+                    iter_data = {
+                        "cam": curr_data["cam"], "im": keyframe["color"], "depth": keyframe["depth"],
+                        "id": iter_time_idx, "intrinsics": curr_data["intrinsics"], "w2c": first_frame_w2c,
+                        "iter_gt_w2c_list": gt_w2c_all_frames[:iter_time_idx + 1],
+                    }
+                loss, variables, _ = get_loss(
+                    params, iter_data, variables, iter_time_idx, config["mapping"]["loss_weights"],
+                    config["mapping"]["use_sil_for_loss"], config["mapping"]["sil_thres"],
+                    config["mapping"]["use_l1"], config["mapping"]["ignore_outlier_depth_loss"], mapping=True,
+                    capture_iteration=iteration, capture_frame=time_idx,
+                )
+                loss.backward()
+                with torch.no_grad():
+                    if config["mapping"]["prune_gaussians"]:
+                        params, variables = prune_gaussians(
+                            params, variables, optimizer, iteration, config["mapping"]["pruning_dict"]
+                        )
+                    if config["mapping"]["use_gaussian_splatting_densification"]:
+                        params, variables = densify(
+                            params, variables, optimizer, iteration, config["mapping"]["densify_dict"]
+                        )
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+        finally:
+            np.random.set_state(saved_rng_state)
+    finally:
+        if capture is not None:
+            variables["_native_capture"] = capture
+    return params, variables
+
+
+def _native_mapping_quality(params, variables, config, time_idx, curr_data):
+    return _native_tracking_quality(params, variables, config, time_idx, curr_data)
+
+
+def _native_publish_replay_ids(capture, params, variables, namespace, operation):
+    replay_ids = capture.gaussian_ids(namespace)
+    stable_ids = replay_ids.initialize(int(params["means3D"].shape[0]))
+    capture.record_native_event(
+        "structure",
+        namespace,
+        {"operation": operation, "before_count": 0, "after_count": len(stable_ids),
+         "stable_gaussian_ids": stable_ids},
     )
-    _restore_tracking_state(params, variables, time_idx, pre_tracking_state)
+    variables["_native_capture"] = capture
+    variables["_native_gaussian_ids"] = replay_ids
+
+
+def _finalize_native_streaming_accuracy(pending, strict_params, strict_variables, config, successor_data,
+                                        successor_keyframe_list, gt_w2c_all_frames, first_frame_w2c,
+                                        successor_mapping_rng_state):
+    """Score strict and streaming maps after their independent Mapping paths finish."""
+    capture = strict_variables.get("_native_capture")
+    frame = pending["frame"]
+    iteration = pending["iteration"]
+    successor_frame = frame + 1
+    if capture is None:
+        raise RuntimeError("native streaming finalization requires an active capture session")
+    if successor_data.get("id") != successor_frame or len(gt_w2c_all_frames) != successor_frame + 1:
+        raise RuntimeError("native streaming finalization requires its real final successor frame")
+    if successor_mapping_rng_state is None:
+        raise RuntimeError("native streaming finalization is missing the successor Mapping schedule")
+
+    seed = pending["pre_mapping_seed"]
+    candidate_params = _native_clone_params(pending["candidate_params"])
+    candidate_variables = _native_clone_variables(pending["candidate_variables"])
+    _native_publish_replay_ids(
+        capture, candidate_params, candidate_variables,
+        "SplaTAM.streaming_candidate_replay", "streaming_candidate_replay_initialize",
+    )
+    candidate_blocks, _, _ = _capture_native_successor_tracking_blocks(
+        candidate_params, candidate_variables, config, frame, successor_data,
+        "streaming_candidate_successor_render", iteration, pending["contract"],
+    )
+
+    streaming_params = _native_clone_params(seed["params"])
+    streaming_variables = _native_clone_variables(seed["variables"])
+    _restore_tracking_state(streaming_params, streaming_variables, frame, pending["pre_tracking_state"])
+    _native_publish_replay_ids(
+        capture, streaming_params, streaming_variables,
+        "SplaTAM.final_tracking_replay", "final_tracking_replay_initialize",
+    )
     final_result, _, _ = _run_native_tracking_solver(
-        params,
-        variables,
-        config,
-        time_idx,
-        iter_time_idx,
-        tracking_curr_data,
-        eval_dir,
-        emit_progress=False,
-        capture_iterations={strict_result["completed_iterations"] - 1},
-        capture_stage="streaming_final_render",
+        streaming_params, streaming_variables, config, frame, frame, pending["target_data"], None,
+        emit_progress=False, capture_iterations={iteration}, capture_stage="streaming_final_render",
         optimizer_stage="streaming_final",
     )
-    if final_result["completed_iterations"] != strict_result["completed_iterations"]:
+    if final_result["completed_iterations"] != pending["strict_result"]["completed_iterations"]:
         raise RuntimeError("strict and final native Tracking solves reached different iteration counts")
-    final_capture_iteration = final_result["completed_iterations"] - 1
-    if final_capture_iteration != strict_capture_iteration:
-        raise RuntimeError("strict and final native Tracking renders use different final iterations")
     final_pose_sequence = final_result.get("pose_sequence")
     if final_pose_sequence is None:
         raise RuntimeError("streaming final recomputation did not emit a native pose observation")
-    final_quality = _native_tracking_quality(params, variables, config, iter_time_idx, tracking_curr_data)
-    final_ate = _native_tracking_ate(params, tracking_curr_data, time_idx)
-    replayed_successor_blocks, _, _ = _capture_native_successor_tracking_blocks(
-        params,
-        variables,
-        config,
-        time_idx,
-        successor_tracking_data,
-        "streaming_final_replay_render",
-        final_capture_iteration,
-        contract,
+    _native_mapping_replay(
+        streaming_params, streaming_variables, config, frame, pending["target_data"], seed["keyframe_list"],
+        gt_w2c_all_frames, first_frame_w2c, seed["mapping_rng_state"],
     )
-    if not candidate_successor_blocks:
+    _native_publish_replay_ids(
+        capture, streaming_params, streaming_variables,
+        "SplaTAM.final_mapping_replay", "final_mapping_replay_initialize",
+    )
+    initialize_camera_pose(streaming_params, successor_frame, forward_prop=config["tracking"]["forward_prop"])
+    _run_native_tracking_solver(
+        streaming_params, streaming_variables, config, successor_frame, successor_frame, successor_data, None,
+        emit_progress=False, capture_iterations={iteration}, capture_stage="streaming_final_successor_recompute_render",
+        optimizer_stage="streaming_final_replay",
+    )
+    replayed_blocks, _, _ = _capture_native_successor_tracking_blocks(
+        streaming_params, streaming_variables, config, frame, successor_data,
+        "streaming_final_replay_render", iteration, pending["contract"],
+    )
+    if not candidate_blocks:
         raise RuntimeError("native streaming candidate produced no downstream block work")
-    replay_ratio = len(replayed_successor_blocks) / len(candidate_successor_blocks)
+    _native_mapping_replay(
+        streaming_params, streaming_variables, config, successor_frame, successor_data, successor_keyframe_list,
+        gt_w2c_all_frames, first_frame_w2c, successor_mapping_rng_state,
+    )
+    strict_quality = _native_mapping_quality(strict_params, strict_variables, config, frame, pending["target_data"])
+    streaming_quality = _native_mapping_quality(streaming_params, streaming_variables, config, frame, pending["target_data"])
     capture.record_native_event(
         "accuracy",
         "SplaTAM.native_streaming_accuracy",
         {
             "strict_commit": {
-                "ate": strict_ate,
-                "mapping_quality": strict_quality,
-                "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
-                "tracking_convergence": {
-                    "completed_iterations": strict_result["completed_iterations"],
-                    "best_loss": strict_result["best_loss"],
-                    "final_weighted_loss": strict_result["losses"]["loss"],
-                },
-                "native_pose_sequence": strict_pose_sequence,
+                "ate": _native_tracking_ate(strict_params, successor_data, successor_frame),
+                "mapping_quality": strict_quality, "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
+                "tracking_convergence": {"completed_iterations": pending["strict_result"]["completed_iterations"],
+                                         "best_loss": pending["strict_result"]["best_loss"],
+                                         "final_weighted_loss": pending["strict_result"]["losses"]["loss"]},
+                "native_pose_sequence": pending["strict_pose_sequence"],
             },
             "streaming_commit": {
-                "ate": final_ate,
-                "mapping_quality": final_quality,
-                "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
-                "tracking_convergence": {
-                    "completed_iterations": final_result["completed_iterations"],
-                    "best_loss": final_result["best_loss"],
-                    "final_weighted_loss": final_result["losses"]["loss"],
-                    "candidate_successor_blocks": len(candidate_successor_blocks),
-                    "replayed_successor_blocks": len(replayed_successor_blocks),
-                },
-                "replay_ratio": replay_ratio,
-                "convergence_rounds": 1,
-                "schedule_sequence": candidate["schedule_sequence"],
+                "ate": _native_tracking_ate(streaming_params, successor_data, successor_frame),
+                "mapping_quality": streaming_quality, "quality_protocol": _NATIVE_QUALITY_PROTOCOL,
+                "tracking_convergence": {"completed_iterations": final_result["completed_iterations"],
+                                         "best_loss": final_result["best_loss"],
+                                         "final_weighted_loss": final_result["losses"]["loss"],
+                                         "candidate_successor_blocks": len(candidate_blocks),
+                                         "replayed_successor_blocks": len(replayed_blocks)},
+                "replay_ratio": len(replayed_blocks) / len(candidate_blocks), "convergence_rounds": 1,
+                "schedule_sequence": pending["candidate"]["schedule_sequence"],
                 "final_native_pose_sequence": final_pose_sequence,
             },
         },
@@ -1691,6 +1847,7 @@ def rgbd_slam(config: dict):
         variables["_native_streaming_capture_frame"] = capture_frame
         variables["_native_streaming_contract"] = _load_frozen_streaming_capture_contract()
         variables["_native_minimal_capture_scope"] = True
+    native_streaming_pending = None
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
@@ -1789,18 +1946,14 @@ def rgbd_slam(config: dict):
                     source_frame=iter_time_idx,
                 )
         if streaming_target and native_tracking_result is not None:
-            if successor_tracking_data is None:
-                raise RuntimeError("native streaming accuracy has no immediate successor Tracking input")
             streaming_start_time = time.time()
-            _record_native_streaming_accuracy(
+            native_streaming_pending = _prepare_native_streaming_accuracy(
                 params,
                 variables,
                 config,
                 time_idx,
                 iter_time_idx,
                 tracking_curr_data,
-                successor_tracking_data,
-                eval_dir,
                 native_tracking_result,
                 pre_tracking_state,
                 variables["_native_streaming_contract"],
@@ -1834,6 +1987,18 @@ def rgbd_slam(config: dict):
 
         # Densification & KeyFrame-based Mapping
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
+            native_pre_mapping_seed = None
+            if streaming_target:
+                native_pre_mapping_seed = {
+                    "params": _native_clone_params(params),
+                    "variables": _native_clone_variables(variables),
+                    "keyframe_list": _native_clone_keyframe_list(keyframe_list),
+                    "mapping_rng_state": copy.deepcopy(np.random.get_state()),
+                }
+            if streaming_successor:
+                if native_streaming_pending is None:
+                    raise RuntimeError("native streaming capture lost its target before successor Mapping")
+                native_streaming_pending["successor_mapping_rng_state"] = copy.deepcopy(np.random.get_state())
             # Densification
             if config['mapping']['add_new_gaussians'] and time_idx > 0:
                 # Setup Data for Densification
@@ -1971,6 +2136,11 @@ def rgbd_slam(config: dict):
             mapping_frame_time_sum += mapping_end_time - mapping_start_time
             mapping_frame_time_count += 1
 
+            if streaming_target:
+                if native_streaming_pending is None or native_pre_mapping_seed is None:
+                    raise RuntimeError("native streaming capture lost the target pre-Mapping state")
+                native_streaming_pending["pre_mapping_seed"] = native_pre_mapping_seed
+
             if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
                 try:
                     # Report Mapping Progress
@@ -2004,6 +2174,24 @@ def rgbd_slam(config: dict):
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
+
+        if streaming_successor:
+            if native_streaming_pending is None:
+                raise RuntimeError("native streaming capture lost its target before finalization")
+            streaming_start_time = time.time()
+            _finalize_native_streaming_accuracy(
+                native_streaming_pending,
+                params,
+                variables,
+                config,
+                tracking_curr_data,
+                _native_clone_keyframe_list(keyframe_list),
+                gt_w2c_all_frames,
+                first_frame_w2c,
+                native_streaming_pending.get("successor_mapping_rng_state"),
+            )
+            streaming_accuracy_seconds += time.time() - streaming_start_time
+            native_streaming_pending = None
         
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
