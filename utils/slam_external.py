@@ -267,21 +267,23 @@ def _capture_append_ids(params, variables, count, operation):
 
 def _capture_retain_ids(params, variables, keep_mask, operation):
     capture = variables.get("_native_capture")
-    if capture is None or variables.get("_native_minimal_capture_scope"):
+    stable_ids = variables.get("_native_gaussian_ids")
+    if stable_ids is None:
         return
-    stable_ids = variables["_native_gaussian_ids"]
     before_count = len(stable_ids.ids)
     removed = stable_ids.retain(keep_mask)
-    capture.record_native_event(
-        "structure",
-        f"slam_external.{operation}",
-        {
-            "operation": operation,
-            "before_count": before_count,
-            "after_count": int(params["means3D"].shape[0]),
-            "removed_stable_ids": removed,
-        },
-    )
+    payload = {
+        "operation": operation,
+        "before_count": before_count,
+        "after_count": int(params["means3D"].shape[0]),
+        "removed_stable_ids": removed,
+    }
+    if capture is None:
+        variables.setdefault("_native_pending_structure_events", []).append(
+            (f"slam_external.{operation}", payload)
+        )
+    else:
+        capture.record_native_event("structure", f"slam_external.{operation}", payload)
 
 
 def update_learning_rate(optimizer, means3D_scheduler, iteration):

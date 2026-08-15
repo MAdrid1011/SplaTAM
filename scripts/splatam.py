@@ -88,10 +88,10 @@ def _rasterize_with_capture(rasterizer, render_args, params, variables, frame, i
 
 
 def _record_native_impact_tile(variables, context, stage, evidence, rasterizer):
-    """Keep the final frame-zero Mapping tile for the next-frame withdrawal replay."""
+    """Retain native Mapping tile groups until post-pruning selection."""
     if not variables.get("_native_impact_replay_enabled"):
         return
-    if context.frame != 0 or stage != "mapping_render_rgb":
+    if context.frame != variables.get("_native_impact_capture_frame") or stage != "mapping_render_rgb":
         return
     if context.iteration != variables.get("_native_impact_capture_iteration"):
         return
@@ -107,17 +107,29 @@ def _record_native_impact_tile(variables, context, stage, evidence, rasterizer):
         stable_ids = tuple(context.stable_gaussian_ids[index] for index in point_indices)
         if not stable_ids or len(set(stable_ids)) != len(stable_ids):
             raise RuntimeError("native Mapping tile does not contain a unique stable Gaussian update group")
-        variables["_native_impact_group"] = {
-            "frame": context.frame,
-            "iteration": context.iteration,
-            "source_frame": context.source_frame,
-            "source": context.source,
-            "rasterizer_sequence": evidence.sequence,
-            "tile_index": tile_index,
-            "tile_range": [start, end],
-            "stable_gaussian_ids": stable_ids,
-        }
-        return
+        variables.setdefault("_native_impact_group_candidates", []).append(
+            {
+                "frame": context.frame,
+                "iteration": context.iteration,
+                "source_frame": context.source_frame,
+                "source": context.source,
+                "rasterizer_sequence": evidence.sequence,
+                "tile_index": tile_index,
+                "tile_range": [start, end],
+                "stable_gaussian_ids": stable_ids,
+            }
+        )
+
+
+def _select_native_impact_group(variables):
+    """Bind withdrawal replay to one captured tile that survives Mapping pruning."""
+    candidates = variables.pop("_native_impact_group_candidates", ())
+    current_ids = set(variables["_native_gaussian_ids"].ids)
+    for candidate in candidates:
+        if all(identifier in current_ids for identifier in candidate["stable_gaussian_ids"]):
+            variables["_native_impact_group"] = candidate
+            return
+    raise RuntimeError("native impact capture found no Mapping tile that survived pruning")
 
 
 def _record_loss_mask(variables, frame, iteration, stage, mask, source_frame=None):
@@ -154,6 +166,23 @@ def _capture_replace_ids(params, variables, operation, source):
             "stable_gaussian_ids": active,
         },
     )
+
+
+def _capture_resume_ids(params, variables):
+    """Resume capture without changing the live map's stable identity."""
+    stable_ids = variables.get("_native_gaussian_ids")
+    if stable_ids is None:
+        raise RuntimeError("native capture resume has no Gaussian identity state")
+    stable_ids.require_size(int(params["means3D"].shape[0]))
+
+
+def _flush_native_structure_events(variables):
+    capture = variables.get("_native_capture")
+    if capture is None:
+        return
+    pending = variables.pop("_native_pending_structure_events", ())
+    for source, payload in pending:
+        capture.record_native_event("structure", source, payload)
 
 
 def _record_optimizer_step(variables, params, optimizer, frame, iteration, stage, phase, parameter_names=None):
@@ -729,20 +758,22 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
         capture = variables.get("_native_capture")
-        if capture is not None:
-            stable_ids = variables["_native_gaussian_ids"]
+        stable_ids = variables.get("_native_gaussian_ids")
+        if stable_ids is not None:
             before_count = len(stable_ids.ids)
             added = stable_ids.append(int(new_pt_cld.shape[0]))
-            capture.record_native_event(
-                "structure",
-                "SplaTAM.add_new_gaussians",
-                {
-                    "operation": "add_new_gaussians",
-                    "before_count": before_count,
-                    "after_count": int(params["means3D"].shape[0]),
-                    "added_stable_ids": added,
-                },
-            )
+            payload = {
+                "operation": "add_new_gaussians",
+                "before_count": before_count,
+                "after_count": int(params["means3D"].shape[0]),
+                "added_stable_ids": added,
+            }
+            if capture is None:
+                variables.setdefault("_native_pending_structure_events", []).append(
+                    ("SplaTAM.add_new_gaussians", payload)
+                )
+            else:
+                capture.record_native_event("structure", "SplaTAM.add_new_gaussians", payload)
 
     return params, variables
 
@@ -853,7 +884,7 @@ def _snapshot_impact_baseline(params, variables):
 def _withdraw_native_mapping_group(params, variables, group):
     baseline = variables.get("_native_impact_baseline")
     if baseline is None:
-        raise RuntimeError("native impact replay has no frame-zero Mapping baseline")
+        raise RuntimeError("native impact replay has no Mapping baseline")
     baseline_indices = {identifier: index for index, identifier in enumerate(baseline["stable_gaussian_ids"])}
     current_indices = {identifier: index for index, identifier in enumerate(variables["_native_gaussian_ids"].ids)}
     stable_ids = tuple(group["stable_gaussian_ids"])
@@ -1828,6 +1859,10 @@ def rgbd_slam(config: dict):
             raise RuntimeError("native_impact_replay requires a positive integer mapping.num_iters")
         variables["_native_impact_replay_enabled"] = True
         variables["_native_impact_capture_iteration"] = mapping_iterations - 1
+        impact_capture_frame = config.get("native_impact_capture_frame", 0)
+        if not isinstance(impact_capture_frame, int) or isinstance(impact_capture_frame, bool) or impact_capture_frame < 0:
+            raise RuntimeError("native_impact_capture_frame must be a non-negative integer")
+        variables["_native_impact_capture_frame"] = impact_capture_frame
 
     if config.get("native_streaming_accuracy", False):
         if variables.get("_native_capture") is None:
@@ -1911,8 +1946,7 @@ def rgbd_slam(config: dict):
                 variables["_native_capture"] = None
             try:
                 if streaming_target or streaming_successor:
-                    phase = "target" if streaming_target else "successor"
-                    _capture_replace_ids(params, variables, f"resume_{phase}_tracking_capture", "SplaTAM.rgbd_slam")
+                    _capture_resume_ids(params, variables)
                 native_tracking_result, tracking_seconds, wandb_tracking_step = _run_native_tracking_solver(
                     params, variables, config, time_idx, iter_time_idx, tracking_curr_data, eval_dir,
                     wandb_run=wandb_run if config['use_wandb'] else None,
@@ -2022,6 +2056,7 @@ def rgbd_slam(config: dict):
                                                           config['mean_sq_dist_method'], config['gaussian_distribution'])
                 finally:
                     variables["_native_capture"] = capture
+                _flush_native_structure_events(variables)
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
@@ -2049,7 +2084,10 @@ def rgbd_slam(config: dict):
                 print(f"\nSelected Keyframes at Frame {time_idx}: {selected_time_idx}")
 
             # Reset Optimizer & Learning Rates for Full Map Optimization
-            if variables.get("_native_impact_replay_enabled") and time_idx == 0:
+            if (
+                variables.get("_native_impact_replay_enabled")
+                and time_idx == variables.get("_native_impact_capture_frame")
+            ):
                 _snapshot_impact_baseline(params, variables)
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
 
@@ -2078,7 +2116,8 @@ def rgbd_slam(config: dict):
                 # Loss for current frame
                 capture = variables.get("_native_capture")
                 capture_mapping_tile = (
-                    time_idx == 0 and iter == variables.get("_native_impact_capture_iteration")
+                    time_idx == variables.get("_native_impact_capture_frame")
+                    and iter == variables.get("_native_impact_capture_iteration")
                 )
                 if variables.get("_native_minimal_capture_scope") and not capture_mapping_tile:
                     variables["_native_capture"] = None
@@ -2131,6 +2170,11 @@ def rgbd_slam(config: dict):
                 mapping_iter_time_count += 1
             if num_iters_mapping > 0:
                 progress_bar.close()
+            if (
+                variables.get("_native_impact_replay_enabled")
+                and time_idx == variables.get("_native_impact_capture_frame")
+            ):
+                _select_native_impact_group(variables)
             # Update the runtime numbers
             mapping_end_time = time.time()
             mapping_frame_time_sum += mapping_end_time - mapping_start_time
